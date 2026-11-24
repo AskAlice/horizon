@@ -314,6 +314,7 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
     let file = |name: &str| PackFile {
         path: format!("resourcepacks/{name}.zip"),
         sha1: Some(import::sha1_hex(b"pack")),
+        size: Some(4),
         downloads: vec![format!("https://cdn.modrinth.com/{name}.zip")],
         ..PackFile::default()
     };
@@ -328,13 +329,16 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
         ..import::Pack::default()
     };
     pipeline::write_json(&t.work().join("pack.json"), &pack).unwrap();
-    let report = fetch_with(&t.work(), &|_| {}, &|url, hash, dest| {
+    let report = fetch_with(&t.work(), &|_| {}, &|file| {
+        let url = file.url;
+        assert_eq!(file.size, Some(4));
+        let hash = file.sha1.unwrap();
         let bytes: &[u8] = if url.ends_with("bad.zip") {
             b"corrupt"
         } else {
             b"pack"
         };
-        crate::fetch::store_download(bytes, Some(hash), dest, false)
+        crate::fetch::store_download(bytes, Some(hash), file.dest, file.overwrite)
     })
     .unwrap();
     assert_eq!(
@@ -355,13 +359,14 @@ fn indexed_downloads_are_hash_checked_and_failures_do_not_discard_other_packs() 
         State::Failed
     );
     assert!(!t.work().join("resourcepacks/bad.zip").exists());
-    let again = fetch_with(&t.work(), &|_| {}, &|_, _, _| Err("offline".into())).unwrap();
+    let again = fetch_with(&t.work(), &|_| {}, &|_| Err("offline".into())).unwrap();
     assert_eq!(
         again.files["resourcepacks/good.zip"].state,
         State::Available
     );
     put(&t.work().join("resourcepacks/good.zip"), b"user edit");
-    let again = fetch_with(&t.work(), &|_| {}, &|url, _, _| {
+    let again = fetch_with(&t.work(), &|_| {}, &|file| {
+        let url = file.url;
         assert!(
             !url.ends_with("good.zip"),
             "must not download over an existing file"

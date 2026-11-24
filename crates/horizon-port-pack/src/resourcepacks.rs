@@ -449,15 +449,13 @@ pub fn stage(source: &Path, work: &Path, pack: &import::Pack) -> Result<Report, 
 
 /// Obtain index-listed client resource packs with the same host and checksum rules as mod jars.
 pub fn fetch(work: &Path, hosts: &[&str], log: pipeline::Log) -> Result<Report, String> {
-    fetch_with(work, log, &|url, hash, dest| {
-        crate::fetch::download(url, Some(hash), dest, false, hosts)
-    })
+    fetch_with(work, log, &|file| crate::fetch::download(file, hosts))
 }
 
-fn fetch_with(
+pub(crate) fn fetch_with(
     work: &Path,
     log: pipeline::Log,
-    download: &dyn Fn(&str, &str, &Path) -> Result<(), String>,
+    download: crate::fetch::FetchFile<'_>,
 ) -> Result<Report, String> {
     let pack: import::Pack = pipeline::read_json(&work.join("pack.json"))?;
     let cache = crate::modrinth::Cache::load(&work.join("modrinth.json"));
@@ -510,7 +508,13 @@ fn fetch_with(
                     detail: "no permitted download link in the pack".into(),
                 });
             };
-            download(&url, hash, &dest)?;
+            download(crate::fetch::Download {
+                url: &url,
+                sha1: Some(hash),
+                dest: &dest,
+                size: file.size,
+                overwrite: false,
+            })?;
             Ok(Outcome {
                 state: State::Available,
                 detail:

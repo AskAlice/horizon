@@ -31,7 +31,18 @@ const HOSTS: [&str; 4] = [
     "https://gitlab.com/",
 ];
 /// No mod jar is this large; a bigger answer is not one.
-pub(crate) const MAX_JAR: u64 = 512 << 20;
+pub const MAX_JAR: u64 = 512 << 20;
+
+/// A file selected for a modpack download, after choosing its permitted source.
+pub struct Download<'a> {
+    pub url: &'a str,
+    pub sha1: Option<&'a str>,
+    pub dest: &'a Path,
+    pub size: Option<u64>,
+    pub overwrite: bool,
+}
+
+pub type FetchFile<'a> = &'a dyn Fn(Download<'_>) -> Result<(), String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -100,6 +111,19 @@ pub fn fetch(
     hosts: &[&str],
     log: Log,
 ) -> Result<Fetched, String> {
+    fetch_with(work, records, from, want, log, &|file| {
+        download(file, hosts)
+    })
+}
+
+pub(crate) fn fetch_with(
+    work: &Path,
+    records: &[Record],
+    from: Option<&Path>,
+    want: &dyn Fn(&Record) -> bool,
+    log: Log,
+    fetch_file: FetchFile<'_>,
+) -> Result<Fetched, String> {
     let pack: Pack = read_json(&work.join("pack.json"))?;
     let cache = Cache::load(&work.join("modrinth.json"));
     let files: HashMap<&str, &PackFile> = pack.files.iter().map(|f| (f.path.as_str(), f)).collect();
@@ -137,7 +161,13 @@ pub fn fetch(
             }
         } else if let Some(url) = url_of(file, &cache) {
             log(format!("{}/{} {name}", i + 1, wanted.len()));
-            match download(&url, sha1, &dest, true, hosts) {
+            match fetch_file(Download {
+                url: &url,
+                sha1,
+                dest: &dest,
+                size: file.size,
+                overwrite: true,
+            }) {
                 Ok(()) => outcome(How::Downloaded, url),
                 Err(e) => outcome(How::Failed, e),
             }
@@ -177,7 +207,13 @@ pub fn fetch(
                     .as_deref()
                     .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
                     .ok_or_else(|| format!("{checksum}: no SHA-1"))?;
-                download(&url, Some(sha1), &dest, true, hosts)
+                fetch_file(Download {
+                    url: &url,
+                    sha1: Some(sha1),
+                    dest: &dest,
+                    size: None,
+                    overwrite: true,
+                })
             }) {
             Ok(()) => log(format!("loader: {}", dest.display())),
             Err(e) => log(format!(
@@ -223,17 +259,12 @@ pub fn url_of(file: &PackFile, cache: &Cache) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Downloads `url` to `dest`, kept only if its SHA-1 is `sha1`.
-pub(crate) fn download(
-    url: &str,
-    sha1: Option<&str>,
-    dest: &Path,
-    overwrite: bool,
-    hosts: &[&str],
-) -> Result<(), String> {
-    let response =
-        crate::net::get_from_hosts(url, hosts)?.ok_or_else(|| format!("{url}: not found"))?;
-    store_download(response.into_reader(), sha1, dest, overwrite).map_err(|e| format!("{url}: {e}"))
+/// Download a pack file from the allowed hosts, checking its SHA-1 when supplied.
+pub(crate) fn download(file: Download<'_>, hosts: &[&str]) -> Result<(), String> {
+    let response = crate::net::get_from_hosts(file.url, hosts)?
+        .ok_or_else(|| format!("{}: not found", file.url))?;
+    store_download(response.into_reader(), file.sha1, file.dest, file.overwrite)
+        .map_err(|e| format!("{}: {e}", file.url))
 }
 
 /// Download exactly the manifest jar through the Modrinth CDN.
@@ -321,34 +352,36 @@ where
         }
         file.sync_all().map_err(|e| e.to_string())?;
         drop(file);
-        if overwrite {
-            fs::rename(&part, dest).map_err(|e| e.to_string())
-        } else {
-            match fs::hard_link(&part, dest) {
-                Ok(()) => fs::remove_file(&part).map_err(|e| e.to_string()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e.to_string()),
-                Err(_) => {
-                    let mut out = fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(dest)
-                        .map_err(|e| e.to_string())?;
-                    let copied = std::io::copy(
-                        &mut fs::File::open(&part).map_err(|e| e.to_string())?,
-                        &mut out,
-                    )
-                    .map_err(|e| e.to_string());
-                    drop(out);
-                    if copied.is_err() {
-                        let _ = fs::remove_file(dest);
-                    }
-                    copied.map(|_| ())
-                }
-            }
-        }
+        publish(&part, dest, overwrite)
     })();
     let _ = fs::remove_file(&part);
     result
+}
+
+/// Publish an already verified sibling file with the requested overwrite policy.
+pub fn publish(part: &Path, dest: &Path, overwrite: bool) -> Result<(), String> {
+    if overwrite {
+        fs::rename(part, dest).map_err(|e| e.to_string())
+    } else {
+        match fs::hard_link(part, dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e.to_string()),
+            Err(_) => {
+                let mut input = fs::File::open(part).map_err(|e| e.to_string())?;
+                let mut out = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(dest)
+                    .map_err(|e| e.to_string())?;
+                let copied = std::io::copy(&mut input, &mut out).map_err(|e| e.to_string());
+                drop(out);
+                if copied.is_err() {
+                    let _ = fs::remove_file(dest);
+                }
+                copied.map(|_| ())
+            }
+        }
+    }
 }
 
 /// The jars in a folder of the player's, by SHA-1 and by name, and what a

@@ -342,12 +342,25 @@ pub fn port(
     hosts: &[&str],
     log: Log,
 ) -> Result<(fetch::Fetched, Vec<report::Row>), String> {
+    port_with(work, resources, from, log, &|file| {
+        fetch::download(file, hosts)
+    })
+}
+
+/// Port a modpack using the caller's transport for its selected downloads.
+pub fn port_with(
+    work: &Path,
+    resources: Option<&Path>,
+    from: Option<&Path>,
+    log: Log,
+    download: fetch::FetchFile<'_>,
+) -> Result<(fetch::Fetched, Vec<report::Row>), String> {
     let records = match read_json::<Vec<inventory::Record>>(&work.join("inventory.json")) {
         Ok(r) => r,
         Err(_) => inventory(work, false, log)?,
     };
-    crate::resourcepacks::fetch(work, hosts, log)?;
-    let fetched = fetch::fetch(work, &records, from, &portable, hosts, log)?;
+    crate::resourcepacks::fetch_with(work, log, download)?;
+    let fetched = fetch::fetch_with(work, &records, from, &portable, log, download)?;
     // The jars tell classes and tiers better than metadata alone.
     let records = inventory(work, true, log)?;
     let minecraft = minecraft(work);

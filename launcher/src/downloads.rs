@@ -1,4 +1,4 @@
-//! Bounded, streaming HTTP transfers shared by the launcher's Minecraft pipeline.
+//! Bounded, streaming HTTP transfers shared by the launcher's installers.
 //!
 //! `HORIZON_DOWNLOAD_*` settings are read once when the shared engine starts. Invalid values
 //! retain defaults; `Config` also supports direct configuration. Sizes are bytes, times seconds.
@@ -20,7 +20,8 @@
 //! directory is swept once before use for generated partials whose owning process has exited.
 use futures_util::{stream, StreamExt};
 use reqwest::{header, Client, Response, StatusCode, Url};
-use sha1::{Digest, Sha1};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -109,6 +110,125 @@ pub struct Artifact {
     pub sha1: String,
     pub size: Option<u64>,
 }
+impl Artifact {
+    fn transfer(&self) -> FileDownload<'_> {
+        FileDownload {
+            publication: Publication::Cache,
+            ..FileDownload::new(
+                &self.url,
+                &self.path,
+                Some(Checksum::Sha1(&self.sha1)),
+                self.size,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Checksum<'a> {
+    Sha1(&'a str),
+    Sha256(&'a str),
+    Sha512(&'a str),
+}
+
+impl<'a> Checksum<'a> {
+    pub(crate) fn parts(self) -> (&'static str, &'a str) {
+        match self {
+            Self::Sha1(value) => ("SHA-1", value),
+            Self::Sha256(value) => ("SHA-256", value),
+            Self::Sha512(value) => ("SHA-512", value),
+        }
+    }
+
+    fn validate(self) -> Result<(), Failure> {
+        let (name, value) = self.parts();
+        let digits = match self {
+            Self::Sha1(_) => 40,
+            Self::Sha256(_) => 64,
+            Self::Sha512(_) => 128,
+        };
+        if value.len() != digits || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Failure::permanent(format!(
+                "Artifact requires a {digits}-character {name}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hasher(self) -> Hasher {
+        match self {
+            Self::Sha1(_) => Hasher::Sha1(Sha1::new()),
+            Self::Sha256(_) => Hasher::Sha256(Sha256::new()),
+            Self::Sha512(_) => Hasher::Sha512(Sha512::new()),
+        }
+    }
+}
+
+pub(crate) enum Hasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+impl Hasher {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(hash) => hash.update(bytes),
+            Self::Sha256(hash) => hash.update(bytes),
+            Self::Sha512(hash) => hash.update(bytes),
+        }
+    }
+
+    pub(crate) fn matches(self, expected: &str) -> bool {
+        let actual = match self {
+            Self::Sha1(hash) => format!("{:x}", hash.finalize()),
+            Self::Sha256(hash) => format!("{:x}", hash.finalize()),
+            Self::Sha512(hash) => format!("{:x}", hash.finalize()),
+        };
+        actual.eq_ignore_ascii_case(expected)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Publication {
+    /// Compare with the installed artifact before trying the network.
+    Cache,
+    Replace,
+    Create,
+}
+
+pub(crate) struct FileDownload<'a> {
+    pub url: &'a str,
+    pub path: &'a Path,
+    pub checksum: Option<Checksum<'a>>,
+    pub size: Option<u64>,
+    /// Legacy pack imports pin hashes but treated the manifest size as advisory.
+    pub size_hint: Option<u64>,
+    pub max_size: u64,
+    pub allowed_hosts: Option<&'a [&'a str]>,
+    pub publication: Publication,
+}
+
+impl<'a> FileDownload<'a> {
+    pub(crate) fn new(
+        url: &'a str,
+        path: &'a Path,
+        checksum: Option<Checksum<'a>>,
+        size: Option<u64>,
+    ) -> Self {
+        Self {
+            url,
+            path,
+            checksum,
+            size,
+            size_hint: None,
+            max_size: u64::MAX,
+            allowed_hosts: None,
+            publication: Publication::Replace,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Counters {
     submitted: AtomicU64,
@@ -291,9 +411,15 @@ impl Downloader {
         url: &str,
         range: Option<(u64, u64)>,
         etag: Option<&str>,
+        allowed_hosts: Option<&[&str]>,
     ) -> Result<Connection<'_>, Failure> {
         let mut url = Url::parse(url).map_err(Failure::permanent)?;
-        for _ in 0..=10 {
+        let redirects = if allowed_hosts.is_some() { 5 } else { 10 };
+        for _ in 0..=redirects {
+            if let Some(hosts) = allowed_hosts {
+                horizon_port_pack::net::checked_url(url.as_str(), hosts)
+                    .map_err(Failure::permanent)?;
+            }
             let host = url
                 .host_str()
                 .ok_or_else(|| Failure::permanent("URL has no host"))?
@@ -370,7 +496,7 @@ impl Downloader {
     /// A failed stream retains only bytes flushed to disk. Reusing them requires a strong ETag.
     async fn piece(
         &self,
-        artifact: &Artifact,
+        artifact: &FileDownload<'_>,
         path: &Path,
         bounds: Option<(u64, u64, u64)>,
         validator: Option<&str>,
@@ -393,9 +519,10 @@ impl Downloader {
             let result = async {
                 let mut connection = self
                     .request(
-                        &artifact.url,
+                        artifact.url,
                         ranged.then_some((start + copied, end)),
                         validator.as_deref(),
+                        artifact.allowed_hosts,
                     )
                     .await?;
                 let response = &mut connection.response;
@@ -427,6 +554,9 @@ impl Downloader {
                 } else {
                     artifact.size.or(response.content_length())
                 };
+                if expected.is_some_and(|size| size > artifact.max_size) {
+                    return Err(Failure::permanent("Download exceeds its size limit"));
+                }
                 if expected
                     .zip(response.content_length())
                     .is_some_and(|(a, b)| a != b)
@@ -442,7 +572,11 @@ impl Downloader {
                 let mut received = 0;
                 let body = async {
                     while let Some(chunk) = response.chunk().await? {
-                        if expected.is_some_and(|n| received + chunk.len() as u64 > n) {
+                        let size = received + chunk.len() as u64;
+                        if size > artifact.max_size {
+                            return Err(Failure::permanent("Download exceeds its size limit"));
+                        }
+                        if expected.is_some_and(|n| size > n) {
                             return Err(Failure::range("Response exceeds expected length"));
                         }
                         writer.write_all(&chunk).await?;
@@ -473,15 +607,19 @@ impl Downloader {
         }
         unreachable!()
     }
-    async fn transfer(&self, artifact: &Artifact, path: &Path) -> Result<(), Failure> {
-        if let Some(size) = artifact.size.filter(|&size| {
-            size >= self.config.threshold
+    async fn transfer(&self, artifact: &FileDownload<'_>, path: &Path) -> Result<(), Failure> {
+        if let Some(size) = artifact.size.or(artifact.size_hint).filter(|&size| {
+            size <= artifact.max_size
+                && size >= self.config.threshold
                 && size > self.config.minimum_segment
                 && self.config.segments > 1
         }) {
             let mut attempt = 0;
             let probe = loop {
-                match self.request(&artifact.url, Some((0, 0)), None).await {
+                match self
+                    .request(artifact.url, Some((0, 0)), None, artifact.allowed_hosts)
+                    .await
+                {
                     Err(e) if e.retry && attempt < self.config.retries => {
                         self.pause(attempt, e.after).await;
                         attempt += 1;
@@ -566,8 +704,40 @@ impl Downloader {
     }
     pub async fn download(&self, artifact: &Artifact, cancel: &AtomicBool) -> Result<(), String> {
         self.register(std::slice::from_ref(artifact));
-        self.one(artifact, cancel).await
+        self.one(&artifact.transfer(), cancel).await
     }
+    /// Synchronous install callers can report file progress while sharing the async queue.
+    pub(crate) fn fetch_file(
+        &self,
+        artifact: &FileDownload<'_>,
+        progress: &dyn Fn(f32),
+    ) -> Result<(), String> {
+        let job = self.with_metrics(Arc::new(Metrics {
+            counters: Counters::default(),
+            started: Instant::now(),
+        }));
+        progress(0.);
+        run(async {
+            let cancel = AtomicBool::new(false);
+            let work = job.one(artifact, &cancel);
+            tokio::pin!(work);
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                tokio::select! {
+                    result = &mut work => return result,
+                    _ = tick.tick() => {
+                        if let Some(size) = artifact.size.filter(|&size| size > 0) {
+                            let bytes = job.metrics.counters.bytes.load(Relaxed);
+                            progress((bytes as f32 / size as f32).min(0.99));
+                        }
+                    }
+                }
+            }
+        })?;
+        progress(1.);
+        Ok(())
+    }
+
     fn register(&self, artifacts: &[Artifact]) {
         self.metrics
             .counters
@@ -578,19 +748,22 @@ impl Downloader {
             Relaxed,
         );
     }
-    async fn one(&self, artifact: &Artifact, cancel: &AtomicBool) -> Result<(), String> {
+    async fn one(&self, artifact: &FileDownload<'_>, cancel: &AtomicBool) -> Result<(), String> {
         let start = Instant::now();
         let operation = async {
-            if artifact.sha1.len() != 40 || !artifact.sha1.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(Failure::permanent("Artifact requires a 40-character SHA-1"));
+            if let Some(checksum) = artifact.checksum {
+                checksum.validate()?;
+            }
+            if artifact.size.is_some_and(|size| size > artifact.max_size) {
+                return Err(Failure::permanent("Download exceeds its size limit"));
             }
             let lock = {
                 let mut paths = self.paths.lock().unwrap();
-                match paths.get(&artifact.path).and_then(Weak::upgrade) {
+                match paths.get(artifact.path).and_then(Weak::upgrade) {
                     Some(lock) => lock,
                     None => {
                         let lock = Arc::new(Semaphore::new(1));
-                        paths.insert(artifact.path.clone(), Arc::downgrade(&lock));
+                        paths.insert(artifact.path.to_owned(), Arc::downgrade(&lock));
                         lock
                     }
                 }
@@ -604,7 +777,9 @@ impl Downloader {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
             self.sweep(parent).await;
-            if valid(artifact, &artifact.path, self.config.buffer).await? {
+            if matches!(artifact.publication, Publication::Cache)
+                && valid(artifact, artifact.path, self.config.buffer).await?
+            {
                 return Ok(());
             }
             fs::create_dir_all(parent).await?;
@@ -624,14 +799,41 @@ impl Downloader {
             let result = async {
                 self.transfer(artifact, &scratch.0).await?;
                 if !valid(artifact, &scratch.0, self.config.buffer).await? {
-                    return Err(Failure::permanent(
-                        "Downloaded size or SHA-1 does not match the manifest",
-                    ));
+                    let message = match artifact.checksum {
+                        Some(checksum) => format!(
+                            "Downloaded size or {} checksum does not match the manifest",
+                            checksum.parts().0
+                        ),
+                        None => "Downloaded size does not match the manifest".into(),
+                    };
+                    return Err(Failure::permanent(message));
                 }
                 if cancel.load(Relaxed) {
                     return Err(Failure::permanent(CANCELLED));
                 }
-                fs::rename(&scratch.0, &artifact.path).await?;
+                match artifact.publication {
+                    Publication::Cache => fs::rename(&scratch.0, artifact.path).await?,
+                    Publication::Replace | Publication::Create => {
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .open(&scratch.0)
+                            .await?
+                            .sync_all()
+                            .await?;
+                        if matches!(artifact.publication, Publication::Create) {
+                            let part = scratch.0.clone();
+                            let path = artifact.path.to_owned();
+                            tokio::task::spawn_blocking(move || {
+                                horizon_port_pack::fetch::publish(&part, &path, false)
+                            })
+                            .await
+                            .map_err(Failure::permanent)?
+                            .map_err(Failure::permanent)?;
+                        } else {
+                            fs::rename(&scratch.0, artifact.path).await?;
+                        }
+                    }
+                }
                 Ok(())
             }
             .await;
@@ -646,10 +848,10 @@ impl Downloader {
         {
             let mut paths = self.paths.lock().unwrap();
             if paths
-                .get(&artifact.path)
+                .get(artifact.path)
                 .is_some_and(|p| p.strong_count() == 0)
             {
-                paths.remove(&artifact.path);
+                paths.remove(artifact.path);
             }
         }
         match result {
@@ -724,8 +926,12 @@ impl Downloader {
             metrics: self.metrics.clone(),
             remaining: artifacts.len() as u64,
         };
-        let work = stream::iter(artifacts.iter().map(|a| self.one(a, cancel)))
-            .buffer_unordered(self.config.files);
+        let work = stream::iter(
+            artifacts
+                .iter()
+                .map(|a| async { self.one(&a.transfer(), cancel).await }),
+        )
+        .buffer_unordered(self.config.files);
         tokio::pin!(work);
         while let Some(result) = work.next().await {
             pending.remaining -= 1;
@@ -757,7 +963,7 @@ impl Downloader {
         let operation = async {
             for attempt in 0..=self.config.retries {
                 let result = async {
-                    let mut connection = self.request(url, None, None).await?;
+                    let mut connection = self.request(url, None, None, None).await?;
                     if connection.response.status() != StatusCode::OK {
                         return Err(Failure::permanent("Unexpected partial metadata response"));
                     }
@@ -854,17 +1060,20 @@ async fn cancelled(cancel: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
-async fn valid(artifact: &Artifact, path: &Path, buffer: usize) -> Result<bool, Failure> {
+async fn valid(artifact: &FileDownload<'_>, path: &Path, buffer: usize) -> Result<bool, Failure> {
     let mut file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     let size = file.metadata().await?.len();
-    if artifact.size.is_some_and(|expected| size != expected) {
+    if size > artifact.max_size || artifact.size.is_some_and(|expected| size != expected) {
         return Ok(false);
     }
-    let mut hash = Sha1::new();
+    let Some(checksum) = artifact.checksum else {
+        return Ok(true);
+    };
+    let mut hash = checksum.hasher();
     let mut buffer = vec![0; buffer];
     loop {
         let n = file.read(&mut buffer).await?;
@@ -873,7 +1082,7 @@ async fn valid(artifact: &Artifact, path: &Path, buffer: usize) -> Result<bool, 
         }
         hash.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&artifact.sha1))
+    Ok(hash.matches(checksum.parts().1))
 }
 /// On dropped/cancelled futures, unlink asynchronously after all stream handles have dropped.
 struct Scratch(PathBuf);
@@ -935,7 +1144,12 @@ struct Clients {
 }
 fn build_client(config: &Config, proxy: Option<&str>) -> Result<Client, Failure> {
     let mut builder = Client::builder()
-        .user_agent(concat!("horizon-launcher/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!(
+            "{} horizon-launcher/{} (github.com/{})",
+            crate::backend::REPO,
+            crate::backend::VERSION,
+            crate::backend::REPO
+        ))
         .connect_timeout(config.connect_timeout)
         .read_timeout(config.read_timeout)
         .pool_max_idle_per_host(config.per_host)

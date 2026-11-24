@@ -40,6 +40,9 @@ pub struct PackFile {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
+    /// Size advertised by Modrinth for range transfers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
     /// `required`, `optional` or `unsupported`; empty when not stated.
     pub client: String,
     pub server: String,
@@ -288,6 +291,7 @@ pub fn mrpack(index: &Value, names: &[String]) -> Pack {
         .map(|f| PackFile {
             path: str_of(f, "path"),
             sha1: f["hashes"]["sha1"].as_str().map(str::to_owned),
+            size: f["fileSize"].as_u64().filter(|&n| n > 0),
             client: str_of(&f["env"], "client"),
             server: str_of(&f["env"], "server"),
             downloads: f["downloads"]
@@ -692,7 +696,7 @@ mod tests {
     fn reads_an_mrpack_index() {
         let index = json!({"name": "Small", "dependencies": {"minecraft": "1.21.1", "neoforge": "21.1.233"},
             "files": [{"path": "mods/create.jar", "hashes": {"sha1": "ab"}, "env": {"client": "required", "server": "required"},
-                "downloads": ["https://cdn.modrinth.com/create.jar"]},
+                "downloads": ["https://cdn.modrinth.com/create.jar"], "fileSize": 42000000},
                 {"path": "resourcepacks/look.zip", "hashes": {"sha1": "cd"}}]});
         let names = [
             "overrides/config/a.toml",
@@ -716,7 +720,9 @@ mod tests {
             ("mods", "create.jar")
         );
         assert_eq!(p.files[0].sha1.as_deref(), Some("ab"));
+        assert_eq!(p.files[0].size, Some(42_000_000));
         assert_eq!(p.files[1].kind(), "resourcepacks");
+        assert_eq!(p.files[1].size, None);
         assert_eq!(
             p.overrides,
             BTreeMap::from([("config".into(), 2), ("kubejs".into(), 1)])

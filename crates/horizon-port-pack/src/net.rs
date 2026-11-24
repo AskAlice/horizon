@@ -179,7 +179,8 @@ mod redirect_tests {
     }
 }
 
-fn checked_url(address: &str, hosts: &[&str]) -> Result<url::Url, String> {
+/// Check the initial URL or a redirect against the modpack download policy.
+pub fn checked_url(address: &str, hosts: &[&str]) -> Result<url::Url, String> {
     let url = url::Url::parse(address).map_err(|e| e.to_string())?;
     if url.scheme() != "https"
         || !url.host_str().is_some_and(|host| hosts.contains(&host))

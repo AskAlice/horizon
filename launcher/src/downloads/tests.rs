@@ -108,7 +108,14 @@ impl Server {
                         } else {
                             ("200 OK", String::new(), data.to_vec())
                         };
-                        let header=format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: \"fixture\"\r\n{extra}\r\n",body.len());
+                        let length = if path == "/unknown-length" {
+                            "Connection: close".to_owned()
+                        } else {
+                            format!("Content-Length: {}", body.len())
+                        };
+                        let header = format!(
+                            "HTTP/1.1 {status}\r\n{length}\r\nETag: \"fixture\"\r\n{extra}\r\n"
+                        );
                         if write.write_all(header.as_bytes()).await.is_err() {
                             state.active.fetch_sub(1, Relaxed);
                             return;
@@ -134,6 +141,9 @@ impl Server {
                             }
                         }
                         state.active.fetch_sub(1, Relaxed);
+                        if path == "/unknown-length" {
+                            break;
+                        }
                     }
                 });
             }
@@ -266,6 +276,111 @@ async fn corrupt_cache_is_repaired_duplicates_coalesce_and_bad_hashes_never_publ
     engine.download(&artifact, &cancel).await.unwrap();
     assert_eq!(server.state.requests.lock().unwrap().len(), 2);
 }
+#[tokio::test]
+async fn browser_downloads_verify_the_selected_hash_and_only_segment_large_files() {
+    for (size, segments) in [(32 << 10, true), ((32 << 10) - 1, false)] {
+        let body = data(size);
+        let server = Server::new(body.clone(), Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Downloader::new(config()).unwrap();
+        let (sha256, sha512) = (
+            format!("{:X}", Sha256::digest(&body)),
+            format!("{:x}", Sha512::digest(&body)),
+        );
+        for checksum in [Checksum::Sha256(&sha256), Checksum::Sha512(&sha512)] {
+            let path = dir.path().join("pack.zip");
+            let url = format!("{}/file", server.url);
+            let artifact = FileDownload {
+                max_size: size as u64,
+                ..FileDownload::new(&url, &path, Some(checksum), Some(size as u64))
+            };
+            engine
+                .one(&artifact, &AtomicBool::new(false))
+                .await
+                .unwrap();
+            let requests = std::mem::take(&mut *server.state.requests.lock().unwrap());
+            if segments {
+                assert_eq!(requests[0].1, Some((0, 0)));
+                assert!(requests
+                    .iter()
+                    .any(|r| r.1.is_some_and(|(start, _)| start > 0)));
+            } else {
+                assert_eq!(requests, [("/file".into(), None)]);
+            }
+            assert_eq!(fs::read(&path).await.unwrap(), body);
+
+            let url = format!("{}/corrupt", server.url);
+            let corrupt = FileDownload {
+                url: &url,
+                ..artifact
+            };
+            let error = engine
+                .one(&corrupt, &AtomicBool::new(false))
+                .await
+                .unwrap_err();
+            assert!(error.contains(checksum.parts().0), "{error}");
+            assert_eq!(fs::read(&path).await.unwrap(), body);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            server.state.requests.lock().unwrap().clear();
+        }
+    }
+}
+
+#[tokio::test]
+async fn modpack_downloads_preserve_existing_files_and_accept_advisory_sizes() {
+    let body = data(64 << 10);
+    let server = Server::new(body.clone(), Duration::ZERO).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Downloader::new(config()).unwrap();
+    let path = dir.path().join("resourcepack.zip");
+    let url = format!("{}/file", server.url);
+    let sha1 = format!("{:x}", Sha1::digest(&body));
+    // Old pack manifests weren't required to supply an accurate size.
+    let artifact = FileDownload {
+        max_size: body.len() as u64 + 1,
+        size_hint: Some(body.len() as u64 + 1),
+        publication: Publication::Create,
+        ..FileDownload::new(&url, &path, Some(Checksum::Sha1(&sha1)), None)
+    };
+    let cancel = AtomicBool::new(false);
+    engine.one(&artifact, &cancel).await.unwrap();
+    assert_eq!(
+        server.state.requests.lock().unwrap().as_slice(),
+        &[("/file".into(), Some((0, 0))), ("/file".into(), None)]
+    );
+    assert_eq!(fs::read(&path).await.unwrap(), body);
+
+    fs::write(&path, b"user file").await.unwrap();
+    assert!(engine.one(&artifact, &cancel).await.is_err());
+    assert_eq!(fs::read(&path).await.unwrap(), b"user file");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn bounded_downloads_reject_oversized_streams_and_unapproved_sources() {
+    let server = Server::new(data(64), Duration::ZERO).await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Downloader::new(config()).unwrap();
+    let path = dir.path().join("file.zip");
+    let url = format!("{}/unknown-length", server.url);
+    let artifact = FileDownload {
+        max_size: 63,
+        ..FileDownload::new(&url, &path, None, None)
+    };
+    let cancel = AtomicBool::new(false);
+    let unapproved = FileDownload {
+        allowed_hosts: Some(&["cdn.modrinth.com"]),
+        ..artifact
+    };
+    let error = engine.one(&unapproved, &cancel).await.unwrap_err();
+    assert!(error.contains("allowed HTTPS hosts"), "{error}");
+    assert!(server.state.requests.lock().unwrap().is_empty());
+
+    let error = engine.one(&artifact, &cancel).await.unwrap_err();
+    assert!(error.contains("size limit"), "{error}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[tokio::test]
 #[ignore = "daily"]
 async fn cancellation_and_inactivity_release_resources_and_cleanup() {

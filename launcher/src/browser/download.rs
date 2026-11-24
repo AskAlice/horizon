@@ -1,7 +1,6 @@
 //! Downloads that reach the game folder only when their checksum matches the source's.
 use super::{plain_name, FileRef};
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use crate::downloads::{self, FileDownload};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,11 +39,8 @@ pub fn github_release_asset(url: &str) -> bool {
 /// Bigger than any pack these sources serve (Modrinth caps uploads at 500 MiB).
 const MAX: u64 = 1 << 30;
 
-/// The HTTP agent the sources share, reaching `url` through the player's proxy when one is set
-/// (`proxy`). Modrinth asks for a user agent that names the project.
-///
-/// It is kept between downloads: a fresh agent starts a new connection pool, so one per file would
-/// be a handshake per file, and a modpack brings hundreds.
+/// The pooled HTTP agent for source metadata and images, using the player's proxy when set.
+/// Modrinth asks for a user agent that names the project.
 pub(super) fn agent(url: &str) -> ureq::Agent {
     let spec = crate::proxy::spec_for(url);
     horizon_port_pack::net::keep("browser", spec.as_deref(), |proxy| {
@@ -89,38 +85,6 @@ fn refuse_file(file: &FileRef) -> Option<String> {
     None
 }
 
-/// Hashes as they are written: the strongest one the file lists.
-enum Hasher {
-    Sha512(Sha512),
-    Sha256(Sha256),
-    Sha1(Sha1),
-}
-
-impl Hasher {
-    fn for_file(file: &FileRef) -> Self {
-        match file.checksum() {
-            Some(("SHA-512", _)) => Hasher::Sha512(Sha512::new()),
-            Some(("SHA-256", _)) => Hasher::Sha256(Sha256::new()),
-            _ => Hasher::Sha1(Sha1::new()),
-        }
-    }
-    fn update(&mut self, bytes: &[u8]) {
-        match self {
-            Hasher::Sha512(h) => h.update(bytes),
-            Hasher::Sha256(h) => h.update(bytes),
-            Hasher::Sha1(h) => h.update(bytes),
-        }
-    }
-    fn hex(self) -> String {
-        let bytes: Vec<u8> = match self {
-            Hasher::Sha512(h) => h.finalize().to_vec(),
-            Hasher::Sha256(h) => h.finalize().to_vec(),
-            Hasher::Sha1(h) => h.finalize().to_vec(),
-        };
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-}
-
 /// Copies `reader` into `<folder>/<name>`, `name` being the file's [`plain_name`], hashing on the
 /// way, and keeps it only when the size and checksum match: until then it is `.<name>.part`,
 /// removed on any failure.
@@ -147,14 +111,15 @@ pub(super) fn save_from_anywhere(
     if let Some(why) = refuse_file(file) {
         return Err(why);
     }
-    let (algo, want) = file.checksum().expect("refuse checks for one");
+    let checksum = file.download_checksum().expect("refuse checks for one");
+    let (algo, want) = checksum.parts();
     let name = plain_name(&file.name).expect("refuse checks it");
     fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
     let target = folder.join(&name);
     let part = folder.join(format!(".{name}.part"));
     let result = (|| {
         let mut out = fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
-        let mut hasher = Hasher::for_file(file);
+        let mut hasher = checksum.hasher();
         let (mut done, mut buf) = (0u64, vec![0u8; 1 << 16]);
         loop {
             let n = reader
@@ -174,8 +139,7 @@ pub(super) fn save_from_anywhere(
         if file.size > 0 && done != file.size {
             return Err(format!("Got {done} bytes of {}.", file.size));
         }
-        let got = hasher.hex();
-        if !got.eq_ignore_ascii_case(want) {
+        if !hasher.matches(want) {
             return Err(format!(
                 "The {algo} checksum doesn't match: the file isn't the one its source lists. \
                  Nothing was installed."
@@ -196,12 +160,16 @@ pub fn fetch(file: &FileRef, folder: &Path, progress: &dyn Fn(f32)) -> Result<Pa
     if let Some(why) = refuse(file) {
         return Err(why);
     }
-    let response = agent(&file.url)
-        .get(&file.url)
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(code, _) => format!("{} answered {code}.", file.url),
-            ureq::Error::Transport(t) => format!("No connection: {t}"),
-        })?;
-    save(file, response.into_reader(), folder, progress)
+    let path = folder.join(plain_name(&file.name).expect("refuse checks it"));
+    let artifact = FileDownload {
+        max_size: MAX,
+        ..FileDownload::new(
+            &file.url,
+            &path,
+            file.download_checksum(),
+            (file.size > 0).then_some(file.size),
+        )
+    };
+    downloads::shared()?.fetch_file(&artifact, progress)?;
+    Ok(path)
 }

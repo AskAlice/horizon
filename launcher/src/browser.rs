@@ -195,13 +195,17 @@ pub struct FileRef {
 impl FileRef {
     /// The strongest checksum the source gives: what the download is checked against.
     pub fn checksum(&self) -> Option<(&'static str, &str)> {
-        [
-            ("SHA-512", &self.sha512),
-            ("SHA-256", &self.sha256),
-            ("SHA-1", &self.sha1),
-        ]
-        .into_iter()
-        .find_map(|(algo, h)| Some((algo, h.as_deref()?)))
+        self.download_checksum()
+            .map(crate::downloads::Checksum::parts)
+    }
+
+    fn download_checksum(&self) -> Option<crate::downloads::Checksum<'_>> {
+        use crate::downloads::Checksum;
+        self.sha512
+            .as_deref()
+            .map(Checksum::Sha512)
+            .or_else(|| self.sha256.as_deref().map(Checksum::Sha256))
+            .or_else(|| self.sha1.as_deref().map(Checksum::Sha1))
     }
 }
 

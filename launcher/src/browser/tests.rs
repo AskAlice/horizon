@@ -471,8 +471,9 @@ fn a_download_is_kept_only_when_its_checksum_matches() {
         std::fs::remove_file(path).unwrap();
     }
     // Another file than the one listed: refused, and nothing is left behind.
-    let file = file_for(body, true);
+    let mut file = file_for(body, true);
     let other = b"a resource paCk";
+    file.sha1 = Some(hex(&sha1::Sha1::digest(other)));
     let e = download::save(&file, &other[..], &dir, &|_| {}).unwrap_err();
     assert!(e.contains("SHA-512 checksum doesn't match"), "{e}");
     let short = download::save(&file, &body[..4], &dir, &|_| {}).unwrap_err();

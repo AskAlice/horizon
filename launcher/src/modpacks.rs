@@ -472,13 +472,22 @@ pub fn port(
     from: Option<&Path>,
     log: Log,
 ) -> Result<Imported, String> {
-    pipeline::port(
-        work,
-        resources,
-        from,
-        horizon_addresses::MODPACK_DOWNLOAD_HOSTS,
-        log,
-    )?;
+    use crate::downloads::{self, Checksum, FileDownload, Publication};
+
+    pipeline::port_with(work, resources, from, log, &|file| {
+        let artifact = FileDownload {
+            allowed_hosts: Some(horizon_addresses::MODPACK_DOWNLOAD_HOSTS),
+            max_size: horizon_port_pack::fetch::MAX_JAR,
+            size_hint: file.sha1.and(file.size),
+            publication: if file.overwrite {
+                Publication::Replace
+            } else {
+                Publication::Create
+            },
+            ..FileDownload::new(file.url, file.dest, file.sha1.map(Checksum::Sha1), None)
+        };
+        downloads::shared()?.fetch_file(&artifact, &|_| {})
+    })?;
     prepare_resourcepacks(work);
     load(work)
 }
